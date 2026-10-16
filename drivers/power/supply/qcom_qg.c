@@ -330,6 +330,7 @@ static int qg_update_ocv(struct qcom_qg *qg)
 static int qg_get_capacity(struct qcom_qg *qg, int *capacity)
 {
 	int temp_decidegc;
+	unsigned int ocv_uv;
 	int ret;
 
 	if (!qg->batt_info)
@@ -339,8 +340,36 @@ static int qg_get_capacity(struct qcom_qg *qg, int *capacity)
 	 * If OCV is stale, fall back to using current voltage as a
 	 * rough approximation. This is less accurate under load but
 	 * better than reporting nothing.
+	 *
+	 * Known limitation (observed on-device, FP3 + 65W PD charger):
+	 * loaded terminal voltage is a poor OCV proxy specifically near
+	 * the empty/full knees of the curve, where a small IR-drop from
+	 * charge current can cross a large span of the OCV-to-capacity
+	 * table almost instantly (e.g. reported capacity jumping from a
+	 * genuine ~2% to ~73% the moment a high-current charger attaches,
+	 * while unaffected on a low-current ~1A source). Options
+	 * considered but not yet implemented, in order of effort:
+	 *   1. Rate-limit reported capacity (cap % change per update) -
+	 *      closest to how real fuel-gauge ICs behave; smooths any
+	 *      voltage-spike cause, not just this one.
+	 *   2. Compensate for IR drop: ocv_estimate = vbat - ibat * R,
+	 *      using an assumed/calibrated series resistance. Cheaper,
+	 *      but only as good as the resistance guess.
+	 *   3. Revert to -ENODATA when stale, matching
+	 *      POWER_SUPPLY_PROP_VOLTAGE_OCV's existing behavior - safe,
+	 *      but capacity is then unavailable most of the time on an
+	 *      always-on device that rarely sees a true rest state.
 	 */
-	if (!qg->ocv_uv)
+	if (ktime_get_seconds() - qg->ocv_time <= QG_OCV_STALE_SECS) {
+		ocv_uv = qg->ocv_uv;
+	} else {
+		ret = qg_read_vbat(qg, &qg->vbat_uv);
+		if (ret)
+			return ret;
+		ocv_uv = qg->vbat_uv;
+	}
+
+	if (!ocv_uv)
 		return -ENODATA;
 
 	/* Try to get temperature for temperature-compensated lookup */
@@ -349,7 +378,7 @@ static int qg_get_capacity(struct qcom_qg *qg, int *capacity)
 		temp_decidegc = 250; /* default 25.0 degC */
 
 	*capacity = power_supply_batinfo_ocv2cap(qg->batt_info,
-						 qg->ocv_uv,
+						 ocv_uv,
 						 temp_decidegc);
 
 	return 0;
